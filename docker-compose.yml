@@ -1,0 +1,78 @@
+# Runs the backend: Mongo, Redis, the API and the audit worker.
+#   docker compose up -d --build
+# Needs the JWT keys in server/.env. The web apps run on their own with `pnpm dev`.
+# See "Docker Compose" in server/README.md.
+
+services:
+  mongo:
+    image: docker.io/library/mongo:8
+    restart: unless-stopped
+    command: ['--replSet', 'rs0']
+    volumes:
+      - mongo-data:/data/db
+    # Transactions need a replica set. The first check sets up a one-node rs0;
+    # the check passes once this node can take writes.
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - |
+          try { rs.status() } catch { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) }
+          if (!db.hello().isWritablePrimary) quit(1)
+      interval: 5s
+      start_period: 30s
+
+  redis:
+    image: docker.io/library/redis:8
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+
+  api:
+    build: ./server
+    image: dxg-server
+    restart: unless-stopped
+    env_file: ./server/.env
+    # These replace values in server/.env: the URIs point at the containers instead of the host,
+    # and PORT and UPLOAD_DIR must match the port mapping and the uploads volume below.
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/dxg?replicaSet=rs0
+      PORT: 3000
+      REDIS_URL: redis://redis:6379
+      UPLOAD_DIR: /app/uploads
+    ports:
+      - '3000:3000'
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Same image as the API, started with the worker's entry point instead.
+  audit-worker:
+    build: ./server
+    image: dxg-server
+    restart: unless-stopped
+    command: ['node', 'dist/audit-worker/main.js']
+    env_file: ./server/.env
+    environment:
+      AUDIT_MONGODB_URI: mongodb://mongo:27017/dxg_audit?replicaSet=rs0
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  redis-data:
+  uploads:
